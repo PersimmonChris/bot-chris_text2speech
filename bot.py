@@ -137,6 +137,14 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("Send an audio message and I'll transcribe it.")
         return
 
+    logger.info(
+        "Update %s: received audio message (chat_id=%s, mime=%s, size=%d bytes).",
+        message.message_id,
+        chat.id,
+        mime_type,
+        file_size,
+    )
+
     processing_message = await message.reply_text(PROCESSING_MESSAGE)
 
     stop_event = asyncio.Event()
@@ -178,6 +186,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         stop_event.set()
         await typing_task
         load_duration = time.perf_counter() - load_start
+        logger.info(
+            "Update %s: ready for more audio (elapsed %.2fs).",
+            message.message_id,
+            load_duration,
+        )
         logger.debug("Update %s: total handler duration %.2fs", message.message_id, load_duration)
 
 
@@ -218,8 +231,15 @@ async def _process_audio_message(
 
     result_text = (result_text or "").strip()
     if not result_text:
+        logger.info("Update %s: no speech detected in audio.", message.message_id)
         await processing_message.edit_text(NO_SPEECH_MESSAGE)
         return
+
+    logger.info(
+        "Update %s: transcription completed (%d characters).",
+        message.message_id,
+        len(result_text),
+    )
 
     if len(result_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
         # Split into chunks to stay within Telegram limits.
