@@ -1,0 +1,16 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Environment variables and secrets
+.env
+
+# macOS filesystem noise
+.DS_Store
