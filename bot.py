@@ -29,9 +29,6 @@ DEFAULT_PROMPT = (
     "if no action items, don't mention NO ACTION ITEMS."
 )
 
-PROCESSING_MESSAGE = "Processing audio..."
-FAILURE_MESSAGE = "Couldn't process that audio. Tap to retry."
-NO_SPEECH_MESSAGE = "I couldn't hear any speech in that recording. Try sending it again?"
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
 FORMAT_ERROR_HINTS = (
@@ -56,6 +53,23 @@ class GeminiResult:
 
 
 logger = logging.getLogger("chris_text2speech")
+
+# Global queue for processing audio messages
+audio_queue: Optional[asyncio.Queue] = None
+
+
+@dataclass
+class AudioMessageTask:
+    """Represents an audio message to be processed."""
+    update: Update
+    context: ContextTypes.DEFAULT_TYPE
+    message_id: int
+    chat_id: int
+    file_id: str
+    mime_type: str
+    extension: str
+    caption: str
+    file_size: int
 
 
 def parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -102,6 +116,7 @@ async def typing_indicator(context: ContextTypes.DEFAULT_TYPE, chat_id: int, sto
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enqueue audio messages for processing."""
     message = update.effective_message
     if not message:
         return
@@ -145,11 +160,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_size,
     )
 
-    processing_message = await message.reply_text(PROCESSING_MESSAGE)
-
-    stop_event = asyncio.Event()
-    typing_task = asyncio.create_task(typing_indicator(context, chat.id, stop_event))
-
     logger.debug(
         "Update %s: received file_id=%s unique_id=%s mime=%s size=%s caption=%s",
         message.message_id,
@@ -160,44 +170,108 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         caption or "None",
     )
 
-    load_start = time.perf_counter()
-    try:
-        await _process_audio_message(
-            context=context,
-            message=message,
-            processing_message=processing_message,
-            file_id=file_id,
-            mime_type=mime_type,
-            extension=default_extension,
-            caption=caption,
-            file_size=file_size,
-        )
-    except Exception as exc:  # noqa: BLE001
-        hint = remediation_hint(str(exc))
-        logger.error(
-            "Processing failed for file_id=%s. Root cause: %s | Hint: %s",
-            file_id,
-            exc,
-            hint,
-            exc_info=True,
-        )
-        await processing_message.edit_text(FAILURE_MESSAGE)
-    finally:
-        stop_event.set()
-        await typing_task
-        load_duration = time.perf_counter() - load_start
-        logger.info(
-            "Update %s: ready for more audio (elapsed %.2fs).",
-            message.message_id,
-            load_duration,
-        )
-        logger.debug("Update %s: total handler duration %.2fs", message.message_id, load_duration)
+    # Create task and add to queue
+    task = AudioMessageTask(
+        update=update,
+        context=context,
+        message_id=message.message_id,
+        chat_id=chat.id,
+        file_id=file_id,
+        mime_type=mime_type,
+        extension=default_extension,
+        caption=caption,
+        file_size=file_size,
+    )
+
+    if audio_queue is None:
+        logger.error("Audio queue not initialized. Cannot process message.")
+        await message.reply_text("Bot is not ready. Please try again.")
+        return
+
+    await audio_queue.put(task)
+    logger.info(
+        "Update %s: queued for processing (queue size: %d).",
+        message.message_id,
+        audio_queue.qsize(),
+    )
+
+
+async def process_audio_queue() -> None:
+    """Worker coroutine that processes audio messages from the queue sequentially."""
+    if audio_queue is None:
+        logger.error("Audio queue not initialized.")
+        return
+
+    logger.info("Audio queue worker started.")
+    while True:
+        try:
+            # Wait for a task from the queue
+            task = await audio_queue.get()
+            logger.info(
+                "Update %s: processing (queue size: %d).",
+                task.message_id,
+                audio_queue.qsize(),
+            )
+
+            message = task.update.effective_message
+            if not message:
+                logger.warning("Update %s: message not found, skipping.", task.message_id)
+                audio_queue.task_done()
+                continue
+
+            stop_event = asyncio.Event()
+            typing_task = asyncio.create_task(typing_indicator(task.context, task.chat_id, stop_event))
+
+            load_start = time.perf_counter()
+            try:
+                await _process_audio_message(
+                    context=task.context,
+                    message=message,
+                    file_id=task.file_id,
+                    mime_type=task.mime_type,
+                    extension=task.extension,
+                    caption=task.caption,
+                    file_size=task.file_size,
+                )
+            except Exception as exc:  # noqa: BLE001
+                hint = remediation_hint(str(exc))
+                error_message = f"❌ Errore durante la trascrizione:\n\n{str(exc)}"
+                if hint and hint != "Verify network connectivity and environment configuration.":
+                    error_message += f"\n\n💡 Suggerimento: {hint}"
+                logger.error(
+                    "Processing failed for file_id=%s. Root cause: %s | Hint: %s",
+                    task.file_id,
+                    exc,
+                    hint,
+                    exc_info=True,
+                )
+                try:
+                    await message.reply_text(error_message)
+                except Exception as send_exc:  # noqa: BLE001
+                    logger.error("Failed to send error message: %s", send_exc, exc_info=True)
+            finally:
+                stop_event.set()
+                await typing_task
+                load_duration = time.perf_counter() - load_start
+                logger.info(
+                    "Update %s: processing completed (elapsed %.2fs, queue size: %d).",
+                    task.message_id,
+                    load_duration,
+                    audio_queue.qsize(),
+                )
+                logger.debug("Update %s: total handler duration %.2fs", task.message_id, load_duration)
+                audio_queue.task_done()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Error in audio queue worker: %s", exc, exc_info=True)
+            try:
+                audio_queue.task_done()
+            except Exception:
+                pass  # Queue might be in an inconsistent state, but we continue processing
 
 
 async def _process_audio_message(
     context: ContextTypes.DEFAULT_TYPE,
     message,
-    processing_message,
     file_id: str,
     mime_type: str,
     extension: str,
@@ -232,7 +306,7 @@ async def _process_audio_message(
     result_text = (result_text or "").strip()
     if not result_text:
         logger.info("Update %s: no speech detected in audio.", message.message_id)
-        await processing_message.edit_text(NO_SPEECH_MESSAGE)
+        await message.reply_text("❌ Non è stato rilevato alcun discorso nell'audio. Riprova con un altro messaggio vocale.")
         return
 
     logger.info(
@@ -241,14 +315,14 @@ async def _process_audio_message(
         len(result_text),
     )
 
+    # Send the transcription as a normal message
     if len(result_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
         # Split into chunks to stay within Telegram limits.
         chunks = _chunk_text(result_text, TELEGRAM_MAX_MESSAGE_LENGTH)
-        await processing_message.edit_text(chunks[0])
-        for chunk in chunks[1:]:
+        for chunk in chunks:
             await message.reply_text(chunk)
     else:
-        await processing_message.edit_text(result_text)
+        await message.reply_text(result_text)
 
 
 def transcribe_audio_with_gemini(source_path: str, mime_type: str, prompt: str) -> str:
@@ -485,13 +559,31 @@ def remediation_hint(error_message: str) -> str:
 
 
 def main() -> None:
+    global audio_queue
+
     load_dotenv()
     debug_enabled = parse_bool(os.getenv("DEBUG"), default=False)
     configure_logging(debug_enabled)
 
-    telegram_token = require_env("TELEGRAM_BOT_TOKEN")
+    # Allow using a test bot token for local development
+    # Set TELEGRAM_BOT_TOKEN_TEST in your local .env to use a different bot
+    test_token = os.getenv("TELEGRAM_BOT_TOKEN_TEST")
+    if test_token:
+        telegram_token = test_token
+        logger.info("Using TEST bot token for local development.")
+    else:
+        telegram_token = require_env("TELEGRAM_BOT_TOKEN")
+        logger.info("Using PRODUCTION bot token.")
 
-    application = Application.builder().token(telegram_token).build()
+    # Initialize the audio queue
+    audio_queue = asyncio.Queue()
+
+    # Start the queue worker when the application starts
+    async def post_init(application: Application) -> None:
+        """Start the queue worker after the application is initialized."""
+        asyncio.create_task(process_audio_queue())
+
+    application = Application.builder().token(telegram_token).post_init(post_init).build()
 
     audio_handler = MessageHandler(
         filters.VOICE | filters.AUDIO | filters.Document.AUDIO,
