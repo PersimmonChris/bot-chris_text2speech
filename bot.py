@@ -4,11 +4,13 @@ import base64
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import requests
@@ -30,6 +32,7 @@ DEFAULT_PROMPT = (
 )
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+BATCH_WINDOW_SECONDS = 0.8
 
 FORMAT_ERROR_HINTS = (
     "unsupported audio format",
@@ -56,6 +59,7 @@ logger = logging.getLogger("chris_text2speech")
 
 # Global queue for processing audio messages
 audio_queue: Optional[asyncio.Queue] = None
+audio_worker_task: Optional[asyncio.Task] = None
 
 
 @dataclass
@@ -70,6 +74,9 @@ class AudioMessageTask:
     extension: str
     caption: str
     file_size: int
+    file_name: Optional[str]
+    telegram_timestamp: float
+    whatsapp_timestamp: Optional[float]
 
 
 def parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -133,6 +140,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_id = source.file_id
         file_size = source.file_size or 0
         unique_id = source.file_unique_id
+        file_name = None
         default_extension = ".ogg"
     elif message.audio:
         source = message.audio
@@ -140,6 +148,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_id = source.file_id
         file_size = source.file_size or 0
         unique_id = source.file_unique_id
+        file_name = source.file_name
         default_extension = _extension_from_mime(mime_type) or ".mp3"
     elif message.document and message.document.mime_type and message.document.mime_type.startswith("audio/"):
         source = message.document
@@ -147,6 +156,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_id = source.file_id
         file_size = source.file_size or 0
         unique_id = source.file_unique_id
+        file_name = source.file_name
         default_extension = _extension_from_mime(mime_type) or _extension_from_filename(source.file_name) or ".audio"
     else:
         await message.reply_text("Send an audio message and I'll transcribe it.")
@@ -169,6 +179,18 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_size,
         caption or "None",
     )
+    if file_name:
+        logger.debug("Update %s: source file name=%s", message.message_id, file_name)
+
+    telegram_timestamp = message.date.replace(tzinfo=timezone.utc).timestamp() if message.date else time.time()
+    whatsapp_timestamp = parse_whatsapp_audio_timestamp(file_name)
+    if whatsapp_timestamp is not None:
+        logger.debug(
+            "Update %s: parsed WhatsApp timestamp %.0f from %s",
+            message.message_id,
+            whatsapp_timestamp,
+            file_name,
+        )
 
     # Create task and add to queue
     task = AudioMessageTask(
@@ -181,6 +203,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         extension=default_extension,
         caption=caption,
         file_size=file_size,
+        file_name=file_name,
+        telegram_timestamp=telegram_timestamp,
+        whatsapp_timestamp=whatsapp_timestamp,
     )
 
     if audio_queue is None:
@@ -206,67 +231,132 @@ async def process_audio_queue() -> None:
     while True:
         try:
             # Wait for a task from the queue
-            task = await audio_queue.get()
-            logger.info(
-                "Update %s: processing (queue size: %d).",
-                task.message_id,
-                audio_queue.qsize(),
-            )
+            first_task = await audio_queue.get()
+            batch = [first_task]
+            batch.extend(await collect_audio_batch())
+            ordered_batch = sorted(batch, key=task_order_key)
 
-            message = task.update.effective_message
-            if not message:
-                logger.warning("Update %s: message not found, skipping.", task.message_id)
-                audio_queue.task_done()
-                continue
-
-            stop_event = asyncio.Event()
-            typing_task = asyncio.create_task(typing_indicator(task.context, task.chat_id, stop_event))
-
-            load_start = time.perf_counter()
-            try:
-                await _process_audio_message(
-                    context=task.context,
-                    message=message,
-                    file_id=task.file_id,
-                    mime_type=task.mime_type,
-                    extension=task.extension,
-                    caption=task.caption,
-                    file_size=task.file_size,
-                )
-            except Exception as exc:  # noqa: BLE001
-                hint = remediation_hint(str(exc))
-                error_message = f"❌ Errore durante la trascrizione:\n\n{str(exc)}"
-                if hint and hint != "Verify network connectivity and environment configuration.":
-                    error_message += f"\n\n💡 Suggerimento: {hint}"
-                logger.error(
-                    "Processing failed for file_id=%s. Root cause: %s | Hint: %s",
-                    task.file_id,
-                    exc,
-                    hint,
-                    exc_info=True,
-                )
-                try:
-                    await message.reply_text(error_message)
-                except Exception as send_exc:  # noqa: BLE001
-                    logger.error("Failed to send error message: %s", send_exc, exc_info=True)
-            finally:
-                stop_event.set()
-                await typing_task
-                load_duration = time.perf_counter() - load_start
+            if len(ordered_batch) > 1:
                 logger.info(
-                    "Update %s: processing completed (elapsed %.2fs, queue size: %d).",
+                    "Processing batch of %d audio messages ordered by timestamp.",
+                    len(ordered_batch),
+                )
+
+            for task in ordered_batch:
+                logger.info(
+                    "Update %s: processing (queue size: %d).",
                     task.message_id,
-                    load_duration,
                     audio_queue.qsize(),
                 )
-                logger.debug("Update %s: total handler duration %.2fs", task.message_id, load_duration)
-                audio_queue.task_done()
+
+                message = task.update.effective_message
+                if not message:
+                    logger.warning("Update %s: message not found, skipping.", task.message_id)
+                    audio_queue.task_done()
+                    continue
+
+                stop_event = asyncio.Event()
+                typing_task = asyncio.create_task(typing_indicator(task.context, task.chat_id, stop_event))
+
+                load_start = time.perf_counter()
+                try:
+                    await _process_audio_message(
+                        context=task.context,
+                        message=message,
+                        file_id=task.file_id,
+                        mime_type=task.mime_type,
+                        extension=task.extension,
+                        caption=task.caption,
+                        file_size=task.file_size,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    hint = remediation_hint(str(exc))
+                    error_message = f"❌ Errore durante la trascrizione:\n\n{str(exc)}"
+                    if hint and hint != "Verify network connectivity and environment configuration.":
+                        error_message += f"\n\n💡 Suggerimento: {hint}"
+                    logger.error(
+                        "Processing failed for file_id=%s. Root cause: %s | Hint: %s",
+                        task.file_id,
+                        exc,
+                        hint,
+                        exc_info=True,
+                    )
+                    try:
+                        await message.reply_text(error_message)
+                    except Exception as send_exc:  # noqa: BLE001
+                        logger.error("Failed to send error message: %s", send_exc, exc_info=True)
+                finally:
+                    stop_event.set()
+                    await typing_task
+                    load_duration = time.perf_counter() - load_start
+                    logger.info(
+                        "Update %s: processing completed (elapsed %.2fs, queue size: %d).",
+                        task.message_id,
+                        load_duration,
+                        audio_queue.qsize(),
+                    )
+                    logger.debug("Update %s: total handler duration %.2fs", task.message_id, load_duration)
+                    audio_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("Audio queue worker cancelled.")
+            break
         except Exception as exc:  # noqa: BLE001
+            if "is bound to a different event loop" in str(exc):
+                logger.warning("Stopping audio queue worker due to event loop mismatch during shutdown.")
+                break
             logger.error("Error in audio queue worker: %s", exc, exc_info=True)
-            try:
-                audio_queue.task_done()
-            except Exception:
-                pass  # Queue might be in an inconsistent state, but we continue processing
+
+
+async def collect_audio_batch() -> list[AudioMessageTask]:
+    """Collects additional audio tasks that arrive in a short burst."""
+    if audio_queue is None:
+        return []
+
+    tasks: list[AudioMessageTask] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + BATCH_WINDOW_SECONDS
+
+    while True:
+        timeout = deadline - loop.time()
+        if timeout <= 0:
+            break
+        try:
+            # Extend the window each time a new item arrives so grouped forwards
+            # can be reordered together.
+            task = await asyncio.wait_for(audio_queue.get(), timeout=timeout)
+            tasks.append(task)
+            deadline = loop.time() + BATCH_WINDOW_SECONDS
+        except asyncio.TimeoutError:
+            break
+
+    return tasks
+
+
+def parse_whatsapp_audio_timestamp(file_name: Optional[str]) -> Optional[float]:
+    """
+    Parse WhatsApp audio naming convention, e.g. AUDIO-2026-02-19-19-27-38.m4a.
+    Returns an epoch timestamp for ordering if pattern is present.
+    """
+    if not file_name:
+        return None
+
+    match = re.search(r"(?:AUDIO|PTT)-(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})", file_name, re.IGNORECASE)
+    if not match:
+        return None
+
+    try:
+        year, month, day, hour, minute, second = (int(part) for part in match.groups())
+        return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def task_order_key(task: AudioMessageTask) -> tuple[float, float, int]:
+    """
+    Order by WhatsApp timestamp when available, otherwise Telegram receive time.
+    """
+    primary_timestamp = task.whatsapp_timestamp if task.whatsapp_timestamp is not None else task.telegram_timestamp
+    return (primary_timestamp, task.telegram_timestamp, task.message_id)
 
 
 async def _process_audio_message(
@@ -559,7 +649,7 @@ def remediation_hint(error_message: str) -> str:
 
 
 def main() -> None:
-    global audio_queue
+    global audio_queue, audio_worker_task
 
     load_dotenv()
     debug_enabled = parse_bool(os.getenv("DEBUG"), default=False)
@@ -575,15 +665,31 @@ def main() -> None:
         telegram_token = require_env("TELEGRAM_BOT_TOKEN")
         logger.info("Using PRODUCTION bot token.")
 
-    # Initialize the audio queue
-    audio_queue = asyncio.Queue()
-
     # Start the queue worker when the application starts
     async def post_init(application: Application) -> None:
         """Start the queue worker after the application is initialized."""
-        asyncio.create_task(process_audio_queue())
+        global audio_queue, audio_worker_task
+        audio_queue = asyncio.Queue()
+        audio_worker_task = asyncio.create_task(process_audio_queue())
 
-    application = Application.builder().token(telegram_token).post_init(post_init).build()
+    async def post_shutdown(application: Application) -> None:
+        """Stop worker gracefully when the application shuts down."""
+        global audio_worker_task
+        if audio_worker_task is not None:
+            audio_worker_task.cancel()
+            try:
+                await audio_worker_task
+            except asyncio.CancelledError:
+                pass
+            audio_worker_task = None
+
+    application = (
+        Application.builder()
+        .token(telegram_token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     audio_handler = MessageHandler(
         filters.VOICE | filters.AUDIO | filters.Document.AUDIO,
