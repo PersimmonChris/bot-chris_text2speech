@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import base64
+import json
 import logging
 import mimetypes
 import os
@@ -11,7 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -33,6 +34,8 @@ DEFAULT_PROMPT = (
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 BATCH_WINDOW_SECONDS = 0.8
+TELEGRAM_DRAFT_MIN_INTERVAL_SECONDS = 1.2
+TELEGRAM_DRAFT_MAX_LENGTH = 4096
 
 FORMAT_ERROR_HINTS = (
     "unsupported audio format",
@@ -77,6 +80,58 @@ class AudioMessageTask:
     file_name: Optional[str]
     telegram_timestamp: float
     whatsapp_timestamp: Optional[float]
+
+
+class TelegramDraftStreamer:
+    """Streams partial bot output through Telegram's sendMessageDraft API."""
+
+    def __init__(
+        self,
+        *,
+        bot_token: str,
+        chat_id: int,
+        draft_id: int,
+        message_thread_id: Optional[int] = None,
+        enabled: bool = True,
+    ) -> None:
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.draft_id = draft_id
+        self.message_thread_id = message_thread_id
+        self.enabled = enabled
+        self._last_sent_at = 0.0
+        self._last_text = ""
+        self._lock = asyncio.Lock()
+
+    async def update(self, text: str, *, force: bool = False) -> None:
+        async with self._lock:
+            if not self.enabled:
+                return
+
+            draft_text = _format_draft_text(text)
+            if not draft_text or draft_text == self._last_text:
+                return
+
+            now = time.monotonic()
+            if not force and now - self._last_sent_at < TELEGRAM_DRAFT_MIN_INTERVAL_SECONDS:
+                return
+
+            payload: Dict[str, Any] = {
+                "chat_id": self.chat_id,
+                "draft_id": self.draft_id,
+                "text": draft_text,
+            }
+            if self.message_thread_id is not None:
+                payload["message_thread_id"] = self.message_thread_id
+
+            ok, error = await asyncio.to_thread(send_telegram_message_draft, self.bot_token, payload)
+            if not ok:
+                self.enabled = False
+                logger.info("Telegram draft streaming disabled for chat %s: %s", self.chat_id, error)
+                return
+
+            self._last_sent_at = now
+            self._last_text = draft_text
 
 
 def parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -370,8 +425,18 @@ async def _process_audio_message(
 ) -> None:
     bot = context.bot
     tg_file = await bot.get_file(file_id)
+    chat = message.chat
+    bot_token = getattr(bot, "token", None)
+    draft_streamer = TelegramDraftStreamer(
+        bot_token=bot_token or "",
+        chat_id=chat.id,
+        draft_id=_draft_id_for_message(message.message_id),
+        message_thread_id=getattr(message, "message_thread_id", None),
+        enabled=bool(bot_token) and getattr(chat, "type", None) == "private",
+    )
 
     prompt = DEFAULT_PROMPT + ("\n\n" + caption if caption else "")
+    await draft_streamer.update("Scarico l'audio...", force=True)
 
     with tempfile.TemporaryDirectory(prefix="tts_") as tmp_dir:
         original_path = os.path.join(tmp_dir, f"source{extension}")
@@ -385,12 +450,19 @@ async def _process_audio_message(
             file_size,
             download_duration,
         )
+        await draft_streamer.update("Audio ricevuto. Avvio la trascrizione...", force=True)
+
+        loop = asyncio.get_running_loop()
+
+        def on_stream_text(partial_text: str) -> None:
+            asyncio.run_coroutine_threadsafe(draft_streamer.update(partial_text), loop)
 
         result_text = await asyncio.to_thread(
             transcribe_audio_with_gemini,
             original_path,
             mime_type,
             prompt,
+            on_stream_text,
         )
 
     result_text = (result_text or "").strip()
@@ -404,6 +476,7 @@ async def _process_audio_message(
         message.message_id,
         len(result_text),
     )
+    await draft_streamer.update(result_text, force=True)
 
     # Send the transcription as a normal message
     if len(result_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -415,7 +488,12 @@ async def _process_audio_message(
         await message.reply_text(result_text)
 
 
-def transcribe_audio_with_gemini(source_path: str, mime_type: str, prompt: str) -> str:
+def transcribe_audio_with_gemini(
+    source_path: str,
+    mime_type: str,
+    prompt: str,
+    on_stream_text: Optional[Callable[[str], None]] = None,
+) -> str:
     api_key = require_env("AI_MODEL_API_KEY")
     model = require_env("AI_MODEL")
 
@@ -427,7 +505,10 @@ def transcribe_audio_with_gemini(source_path: str, mime_type: str, prompt: str) 
         source_path,
         len(prompt),
     )
-    result = call_gemini(api_key, model, source_path, mime_type, prompt)
+    result = call_gemini_stream(api_key, model, source_path, mime_type, prompt, on_stream_text)
+    if not result.ok:
+        logger.debug("Gemini streaming attempt failed, falling back to generateContent: %s", result.error)
+        result = call_gemini(api_key, model, source_path, mime_type, prompt)
     logger.debug(
         "Gemini attempt %d: status=%s duration=%.2fs error=%s",
         attempt,
@@ -449,7 +530,12 @@ def transcribe_audio_with_gemini(source_path: str, mime_type: str, prompt: str) 
                 convert_duration,
                 " ".join(ffmpeg_cmd),
             )
-            result = call_gemini(api_key, model, converted_path, "audio/wav", prompt)
+            if on_stream_text:
+                on_stream_text("Formato convertito. Continuo la trascrizione...")
+            result = call_gemini_stream(api_key, model, converted_path, "audio/wav", prompt, on_stream_text)
+            if not result.ok:
+                logger.debug("Gemini WAV streaming attempt failed, falling back to generateContent: %s", result.error)
+                result = call_gemini(api_key, model, converted_path, "audio/wav", prompt)
             logger.debug(
                 "Gemini attempt %d (WAV): status=%s duration=%.2fs error=%s",
                 attempt,
@@ -471,6 +557,118 @@ def transcribe_audio_with_gemini(source_path: str, mime_type: str, prompt: str) 
 
     root_cause = result.error or "Unknown error from Gemini"
     raise RuntimeError(root_cause)
+
+
+def call_gemini_stream(
+    api_key: str,
+    model: str,
+    audio_path: str,
+    mime_type: str,
+    prompt: str,
+    on_stream_text: Optional[Callable[[str], None]] = None,
+) -> GeminiResult:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent"
+    headers = {"Content-Type": "application/json"}
+
+    with open(audio_path, "rb") as audio_file:
+        audio_bytes = audio_file.read()
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64.b64encode(audio_bytes).decode("utf-8"),
+                        }
+                    },
+                ],
+            }
+        ]
+    }
+
+    start_time = time.perf_counter()
+    try:
+        response = requests.post(
+            url,
+            params={"key": api_key, "alt": "sse"},
+            headers=headers,
+            json=payload,
+            timeout=120,
+            stream=True,
+        )
+    except requests.RequestException as exc:
+        return GeminiResult(ok=False, error=str(exc), duration=None)
+
+    status_code = response.status_code
+    if status_code != 200:
+        duration = time.perf_counter() - start_time
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+        if data and "error" in data:
+            message = data["error"].get("message", "Gemini streaming API returned an error.")
+            return GeminiResult(ok=False, error=message, raw=data, status_code=status_code, duration=duration)
+        return GeminiResult(
+            ok=False,
+            error=f"Gemini streaming API error {status_code}: {response.text}",
+            status_code=status_code,
+            duration=duration,
+        )
+
+    pieces: list[str] = []
+    raw_events: list[Dict[str, Any]] = []
+    try:
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                continue
+
+            data_text = line.removeprefix("data:").strip()
+            if data_text == "[DONE]":
+                break
+
+            try:
+                event = json.loads(data_text)
+            except json.JSONDecodeError:
+                logger.debug("Skipping malformed Gemini stream event: %s", data_text)
+                continue
+
+            raw_events.append(event)
+            chunk = _extract_candidate(event)
+            if not chunk:
+                continue
+
+            pieces.append(chunk)
+            combined = "".join(pieces)
+            if on_stream_text:
+                on_stream_text(combined)
+    except requests.RequestException as exc:
+        return GeminiResult(
+            ok=False,
+            error=str(exc),
+            raw={"events": raw_events},
+            status_code=status_code,
+            duration=time.perf_counter() - start_time,
+        )
+
+    duration = time.perf_counter() - start_time
+    text = "".join(pieces).strip()
+    if text:
+        return GeminiResult(ok=True, text=text, raw={"events": raw_events}, status_code=status_code, duration=duration)
+
+    return GeminiResult(
+        ok=False,
+        error="Gemini streaming response missing transcript text.",
+        raw={"events": raw_events},
+        status_code=status_code,
+        duration=duration,
+    )
 
 
 def call_gemini(api_key: str, model: str, audio_path: str, mime_type: str, prompt: str) -> GeminiResult:
@@ -631,6 +829,48 @@ def _extension_from_filename(filename: Optional[str]) -> Optional[str]:
 
 def _chunk_text(text: str, chunk_size: int) -> list[str]:
     return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def _draft_id_for_message(message_id: int) -> int:
+    return max(1, message_id)
+
+
+def _format_draft_text(text: str) -> str:
+    draft_text = (text or "").strip()
+    if not draft_text:
+        return ""
+    if len(draft_text) <= TELEGRAM_DRAFT_MAX_LENGTH:
+        return draft_text
+    suffix = "\n\n..."
+    return draft_text[: TELEGRAM_DRAFT_MAX_LENGTH - len(suffix)].rstrip() + suffix
+
+
+def send_telegram_message_draft(bot_token: str, payload: Dict[str, Any]) -> tuple[bool, str]:
+    if not bot_token:
+        return False, "missing bot token"
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessageDraft"
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+    except requests.RequestException as exc:
+        return False, str(exc)
+
+    if response.status_code == 200:
+        try:
+            data = response.json()
+        except ValueError:
+            return False, "Telegram returned a non-JSON response"
+        if data.get("ok") is True:
+            return True, ""
+        return False, data.get("description", "Telegram rejected sendMessageDraft")
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if data and data.get("description"):
+        return False, data["description"]
+    return False, f"Telegram sendMessageDraft HTTP {response.status_code}: {response.text}"
 
 
 def remediation_hint(error_message: str) -> str:
