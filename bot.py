@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from dotenv import load_dotenv
@@ -26,13 +27,15 @@ from telegram.ext import (
 DEFAULT_PROMPT = (
     "Convert this to text while keeping the tone of voice. Remove only the ‘ehm’ and "
     "other filler words—if in doubt, keep them. Preserve the speaker’s original word "
-    "choices—don’t make assumptions. At the end, list any action items if relevant "
-    "(for example, if the speaker mentioned something that needs fixing)."
-    "if no action items, don't mention NO ACTION ITEMS."
+    "choices—don’t make assumptions. At the end, list action items only if relevant. "
+    "Use exactly this heading for them: Cose da fare:. Put each action item on its own "
+    "line starting with '- '. Do not use Markdown, bold, asterisks, HTML, or extra "
+    "labels. If there are no action items, do not mention action items at all."
 )
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 BATCH_WINDOW_SECONDS = 0.8
+DEFAULT_DISPLAY_TIMEZONE = "Europe/Rome"
 
 FORMAT_ERROR_HINTS = (
     "unsupported audio format",
@@ -42,6 +45,18 @@ FORMAT_ERROR_HINTS = (
     "format",
     "ogg",
     "opus",
+)
+
+TEMPORARY_MODEL_ERROR_HINTS = (
+    "high demand",
+    "try again later",
+    "temporarily unavailable",
+    "resource exhausted",
+    "rate limit",
+    "quota",
+    "overloaded",
+    "503",
+    "429",
 )
 
 
@@ -77,6 +92,8 @@ class AudioMessageTask:
     file_name: Optional[str]
     telegram_timestamp: float
     whatsapp_timestamp: Optional[float]
+    sender_label: Optional[str]
+    source_timestamp: float
 
 
 def parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -183,7 +200,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.debug("Update %s: source file name=%s", message.message_id, file_name)
 
     telegram_timestamp = message.date.replace(tzinfo=timezone.utc).timestamp() if message.date else time.time()
-    whatsapp_timestamp = parse_whatsapp_audio_timestamp(file_name)
+    display_tz = get_display_timezone()
+    whatsapp_timestamp = parse_whatsapp_audio_timestamp(file_name, display_tz)
     if whatsapp_timestamp is not None:
         logger.debug(
             "Update %s: parsed WhatsApp timestamp %.0f from %s",
@@ -191,6 +209,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             whatsapp_timestamp,
             file_name,
         )
+
+    sender_label = forwarded_sender_label(message) or caption or None
+    source_timestamp = forwarded_message_timestamp(message) or whatsapp_timestamp or telegram_timestamp
 
     # Create task and add to queue
     task = AudioMessageTask(
@@ -206,6 +227,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_name=file_name,
         telegram_timestamp=telegram_timestamp,
         whatsapp_timestamp=whatsapp_timestamp,
+        sender_label=sender_label,
+        source_timestamp=source_timestamp,
     )
 
     if audio_queue is None:
@@ -268,6 +291,8 @@ async def process_audio_queue() -> None:
                         extension=task.extension,
                         caption=task.caption,
                         file_size=task.file_size,
+                        sender_label=task.sender_label,
+                        source_timestamp=task.source_timestamp,
                     )
                 except Exception as exc:  # noqa: BLE001
                     hint = remediation_hint(str(exc))
@@ -332,7 +357,7 @@ async def collect_audio_batch() -> list[AudioMessageTask]:
     return tasks
 
 
-def parse_whatsapp_audio_timestamp(file_name: Optional[str]) -> Optional[float]:
+def parse_whatsapp_audio_timestamp(file_name: Optional[str], display_tz: ZoneInfo) -> Optional[float]:
     """
     Parse WhatsApp audio naming convention, e.g. AUDIO-2026-02-19-19-27-38.m4a.
     Returns an epoch timestamp for ordering if pattern is present.
@@ -346,9 +371,126 @@ def parse_whatsapp_audio_timestamp(file_name: Optional[str]) -> Optional[float]:
 
     try:
         year, month, day, hour, minute, second = (int(part) for part in match.groups())
-        return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc).timestamp()
+        return datetime(year, month, day, hour, minute, second, tzinfo=display_tz).timestamp()
     except ValueError:
         return None
+
+
+def get_display_timezone() -> ZoneInfo:
+    timezone_name = os.getenv("DISPLAY_TIMEZONE", DEFAULT_DISPLAY_TIMEZONE)
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        logger.warning("Invalid DISPLAY_TIMEZONE=%s; falling back to %s.", timezone_name, DEFAULT_DISPLAY_TIMEZONE)
+        return ZoneInfo(DEFAULT_DISPLAY_TIMEZONE)
+
+
+def forwarded_sender_label(message) -> Optional[str]:
+    origin = getattr(message, "forward_origin", None)
+    if not origin:
+        return None
+
+    sender_user = getattr(origin, "sender_user", None)
+    if sender_user:
+        return sender_user.full_name
+
+    sender_user_name = getattr(origin, "sender_user_name", None)
+    if sender_user_name:
+        return sender_user_name
+
+    sender_chat = getattr(origin, "sender_chat", None) or getattr(origin, "chat", None)
+    if sender_chat:
+        return getattr(sender_chat, "title", None) or getattr(sender_chat, "full_name", None)
+
+    author_signature = getattr(origin, "author_signature", None)
+    if author_signature:
+        return author_signature
+
+    return None
+
+
+def forwarded_message_timestamp(message) -> Optional[float]:
+    origin = getattr(message, "forward_origin", None)
+    origin_date = getattr(origin, "date", None) if origin else None
+    if not origin_date:
+        return None
+    if origin_date.tzinfo is None:
+        origin_date = origin_date.replace(tzinfo=timezone.utc)
+    return origin_date.timestamp()
+
+
+def build_telegram_response(text: str, sender_label: Optional[str], source_timestamp: float) -> str:
+    transcript = format_transcription((text or "").strip())
+    if not transcript:
+        return ""
+
+    footer = format_source_footer(sender_label, source_timestamp)
+    return f"{transcript}\n\n----\n{footer}" if footer else transcript
+
+
+def format_transcription(text: str) -> str:
+    lines = text.splitlines()
+    formatted_lines: list[str] = []
+    in_action_items = False
+
+    for line in lines:
+        stripped = line.strip()
+        action_heading = re.fullmatch(
+            r"(?:\*\*)?\s*(?:Action Items|Cose da fare):?\s*(?:\*\*)?",
+            stripped,
+            re.IGNORECASE,
+        )
+        if action_heading:
+            formatted_lines.append("Cose da fare:")
+            in_action_items = True
+            continue
+
+        bullet_match = re.match(r"^\s*(?:[-*•]\s+)(.+)$", line)
+        if in_action_items and bullet_match:
+            formatted_lines.append(f"• {bullet_match.group(1).strip()}")
+            continue
+
+        formatted_lines.append(line)
+
+    return "\n".join(formatted_lines).strip()
+
+
+def format_source_footer(sender_label: Optional[str], source_timestamp: float) -> str:
+    formatted_date = format_italian_datetime(source_timestamp)
+    if sender_label:
+        return f"Da {sender_label}, {formatted_date}"
+    return f"Ricevuto {formatted_date}"
+
+
+def format_italian_datetime(timestamp: float) -> str:
+    display_tz = get_display_timezone()
+    local_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(display_tz)
+    weekdays = (
+        "lunedì",
+        "martedì",
+        "mercoledì",
+        "giovedì",
+        "venerdì",
+        "sabato",
+        "domenica",
+    )
+    months = (
+        "gennaio",
+        "febbraio",
+        "marzo",
+        "aprile",
+        "maggio",
+        "giugno",
+        "luglio",
+        "agosto",
+        "settembre",
+        "ottobre",
+        "novembre",
+        "dicembre",
+    )
+    weekday = weekdays[local_dt.weekday()]
+    month = months[local_dt.month - 1]
+    return f"{weekday} {local_dt.day} {month} {local_dt.year} alle {local_dt:%H.%M}"
 
 
 def task_order_key(task: AudioMessageTask) -> tuple[float, float, int]:
@@ -367,11 +509,13 @@ async def _process_audio_message(
     extension: str,
     caption: str,
     file_size: int,
+    sender_label: Optional[str],
+    source_timestamp: float,
 ) -> None:
     bot = context.bot
     tg_file = await bot.get_file(file_id)
 
-    prompt = DEFAULT_PROMPT + ("\n\n" + caption if caption else "")
+    prompt = DEFAULT_PROMPT
 
     with tempfile.TemporaryDirectory(prefix="tts_") as tmp_dir:
         original_path = os.path.join(tmp_dir, f"source{extension}")
@@ -393,7 +537,7 @@ async def _process_audio_message(
             prompt,
         )
 
-    result_text = (result_text or "").strip()
+    result_text = build_telegram_response(result_text, sender_label, source_timestamp)
     if not result_text:
         logger.info("Update %s: no speech detected in audio.", message.message_id)
         await message.reply_text("❌ Non è stato rilevato alcun discorso nell'audio. Riprova con un altro messaggio vocale.")
@@ -405,7 +549,7 @@ async def _process_audio_message(
         len(result_text),
     )
 
-    # Send the transcription as a normal message
+    # Send the transcription as plain text.
     if len(result_text) > TELEGRAM_MAX_MESSAGE_LENGTH:
         # Split into chunks to stay within Telegram limits.
         chunks = _chunk_text(result_text, TELEGRAM_MAX_MESSAGE_LENGTH)
@@ -418,11 +562,14 @@ async def _process_audio_message(
 def transcribe_audio_with_gemini(source_path: str, mime_type: str, prompt: str) -> str:
     api_key = require_env("AI_MODEL_API_KEY")
     model = require_env("AI_MODEL")
+    fallback_model = os.getenv("AI_MODEL_FALLBACK", "").strip()
+    active_model = model
 
     attempt = 1
     logger.debug(
-        "Preparing Gemini request attempt %d: mime=%s path=%s prompt_chars=%d",
+        "Preparing Gemini request attempt %d: model=%s mime=%s path=%s prompt_chars=%d",
         attempt,
+        model,
         mime_type,
         source_path,
         len(prompt),
@@ -440,6 +587,26 @@ def transcribe_audio_with_gemini(source_path: str, mime_type: str, prompt: str) 
         logger.debug("Gemini transcription succeeded on attempt %d (%d chars).", attempt, len(result.text))
         return result.text
 
+    if result.error and fallback_model and fallback_model != model and should_retry_with_fallback_model(result.error):
+        attempt += 1
+        logger.info("Primary model %s unavailable; retrying with fallback model %s.", model, fallback_model)
+        active_model = fallback_model
+        result = call_gemini(api_key, fallback_model, source_path, mime_type, prompt)
+        logger.debug(
+            "Gemini attempt %d (fallback): status=%s duration=%.2fs error=%s",
+            attempt,
+            result.status_code,
+            result.duration or 0.0,
+            result.error or "None",
+        )
+        if result.ok and result.text:
+            logger.debug(
+                "Gemini transcription succeeded with fallback model %s (%d chars).",
+                fallback_model,
+                len(result.text),
+            )
+            return result.text
+
     if result.error and should_retry_with_wav(result.error):
         attempt += 1
         converted_path, convert_duration, ffmpeg_cmd = convert_to_wav(source_path)
@@ -449,7 +616,7 @@ def transcribe_audio_with_gemini(source_path: str, mime_type: str, prompt: str) 
                 convert_duration,
                 " ".join(ffmpeg_cmd),
             )
-            result = call_gemini(api_key, model, converted_path, "audio/wav", prompt)
+            result = call_gemini(api_key, active_model, converted_path, "audio/wav", prompt)
             logger.debug(
                 "Gemini attempt %d (WAV): status=%s duration=%.2fs error=%s",
                 attempt,
@@ -576,6 +743,11 @@ def should_retry_with_wav(error_message: str) -> bool:
     return any(keyword in lowered for keyword in FORMAT_ERROR_HINTS)
 
 
+def should_retry_with_fallback_model(error_message: str) -> bool:
+    lowered = error_message.lower()
+    return any(keyword in lowered for keyword in TEMPORARY_MODEL_ERROR_HINTS)
+
+
 def convert_to_wav(source_path: str) -> tuple[str, float, list[str]]:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg is required for format conversion but was not found in PATH.")
@@ -630,7 +802,27 @@ def _extension_from_filename(filename: Optional[str]) -> Optional[str]:
 
 
 def _chunk_text(text: str, chunk_size: int) -> list[str]:
-    return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    chunks: list[str] = []
+    current = ""
+
+    for line in text.splitlines(keepends=True):
+        if len(line) > chunk_size:
+            if current:
+                chunks.append(current.rstrip())
+                current = ""
+            chunks.extend(line[i : i + chunk_size].rstrip() for i in range(0, len(line), chunk_size))
+            continue
+
+        if len(current) + len(line) > chunk_size:
+            chunks.append(current.rstrip())
+            current = line
+        else:
+            current += line
+
+    if current:
+        chunks.append(current.rstrip())
+
+    return chunks
 
 
 def remediation_hint(error_message: str) -> str:
