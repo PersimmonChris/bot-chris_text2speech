@@ -70,7 +70,7 @@ class GeminiResult:
     raw: Optional[Dict[str, Any]] = None
 
 
-logger = logging.getLogger("chris_text2speech")
+logger = logging.getLogger("telegram_speech_to_text")
 
 # Global queue for processing audio messages
 audio_queue: Optional[asyncio.Queue] = None

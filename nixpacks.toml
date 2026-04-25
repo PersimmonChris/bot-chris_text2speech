@@ -1,2 +1,2 @@
 [start]
-cmd = "python bot.py"
+cmd = "python3 bot.py"

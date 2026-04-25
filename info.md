@@ -1,4 +1,4 @@
-# chris_text2speech bot - quick start
+# Telegram speech-to-text bot - quick start
 
 Follow these steps to get the bot running even if you have never built a Telegram bot before.
 
@@ -6,7 +6,7 @@ Follow these steps to get the bot running even if you have never built a Telegra
 - **Create a Telegram bot token**  
   1. Open Telegram and search for `@BotFather`.  
   2. Start a chat and send `/newbot`.  
-  3. Pick a name (e.g., `Chris Text2Speech`) and a unique username ending in `bot`.  
+  3. Pick a name (e.g., `Speech To Text Bot`) and a unique username ending in `bot`.  
   4. BotFather will reply with an HTTP API token - copy it and keep it safe.
 - **Create a Gemini API key**  
   1. Sign in at [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).  
@@ -31,7 +31,7 @@ Follow these steps to get the bot running even if you have never built a Telegra
   - Windows: use the [FFmpeg download page](https://ffmpeg.org/download.html), unzip the release, and add the `bin` folder to your PATH.
 
 ## 4. Run the bot
-- Start the bot with: `python bot.py`
+- Start the bot with: `python3 bot.py`
 - Leave the terminal window open; the bot stops when you press `Ctrl+C`.
 
 ## 5. Test the flow
@@ -41,7 +41,7 @@ Follow these steps to get the bot running even if you have never built a Telegra
 - Add a caption if you want to give extra instructions (e.g., "translate to English").
 
 ## 6. Where to check for errors
-- All logs print to the same terminal window that runs `python bot.py`.
+- All logs print to the same terminal window that runs `python3 bot.py`.
 - Set `DEBUG=true` in `.env` to see detailed trace logs (file type/size, Gemini attempts, FFmpeg command, timings).
 
 ## 7. Quick fixes
